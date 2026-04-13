@@ -2,13 +2,21 @@
 // Telegram webhook handler — receives updates and processes file/link uploads
 
 import { put } from "@vercel/blob";
-import { kv } from "@vercel/kv";
+import { createClient } from "redis";
 
 const BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
 const TELEGRAM_API = `https://api.telegram.org/bot${BOT_TOKEN}`;
 const BASE_URL = process.env.VERCEL_URL
   ? `https://${process.env.VERCEL_URL}`
   : process.env.BASE_URL;
+
+// Fresh Redis connection per invocation — singleton breaks on Vercel serverless
+async function getRedis() {
+  const client = createClient({ url: process.env.REDIS_URL });
+  client.on("error", (err) => console.error("Redis error:", err));
+  await client.connect();
+  return client;
+}
 
 // ─── Telegram helpers ────────────────────────────────────────────────────────
 
@@ -33,21 +41,19 @@ async function sendMessageWithKeyboard(chatId, text, keyboard) {
   });
 }
 
-async function editMessage(chatId, messageId, text, keyboard = null) {
-  const body = { chat_id: chatId, message_id: messageId, text, parse_mode: "HTML" };
-  if (keyboard) body.reply_markup = { inline_keyboard: keyboard };
+async function editMessage(chatId, messageId, text) {
   await fetch(`${TELEGRAM_API}/editMessageText`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(body),
+    body: JSON.stringify({ chat_id: chatId, message_id: messageId, text, parse_mode: "HTML" }),
   });
 }
 
-async function answerCallback(callbackId, text = "") {
+async function answerCallback(callbackId) {
   await fetch(`${TELEGRAM_API}/answerCallbackQuery`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ callback_query_id: callbackId, text }),
+    body: JSON.stringify({ callback_query_id: callbackId }),
   });
 }
 
@@ -72,9 +78,7 @@ function durationKeyboard() {
       { text: "⏱ 6 hours", callback_data: "dur_21600" },
       { text: "⏱ 12 hours", callback_data: "dur_43200" },
     ],
-    [
-      { text: "⏱ 24 hours", callback_data: "dur_86400" },
-    ],
+    [{ text: "⏱ 24 hours", callback_data: "dur_86400" }],
   ];
 }
 
@@ -84,21 +88,25 @@ function formatDuration(seconds) {
   return "24 hours";
 }
 
-// ─── State management via KV ─────────────────────────────────────────────────
+// ─── Redis helpers ───────────────────────────────────────────────────────────
 
-async function setPendingUpload(chatId, data) {
-  // Store pending upload state for 10 minutes (user must pick duration)
-  await kv.set(`pending:${chatId}`, JSON.stringify(data), { ex: 600 });
+async function setPendingUpload(r, chatId, data) {
+  await r.set(`pending:${chatId}`, JSON.stringify(data), { EX: 600 });
 }
 
-async function getPendingUpload(chatId) {
-  const val = await kv.get(`pending:${chatId}`);
+async function getPendingUpload(r, chatId) {
+  const val = await r.get(`pending:${chatId}`);
   if (!val) return null;
-  return typeof val === "string" ? JSON.parse(val) : val;
+  return JSON.parse(val);
 }
 
-async function clearPendingUpload(chatId) {
-  await kv.del(`pending:${chatId}`);
+async function clearPendingUpload(r, chatId) {
+  await r.del(`pending:${chatId}`);
+}
+
+async function storeFileMeta(r, fileKey, meta) {
+  await r.set(`file:${fileKey}`, JSON.stringify(meta), { EX: meta.ttl + 3600 });
+  await r.zAdd("files_by_expiry", { score: meta.expiresAt, value: fileKey });
 }
 
 // ─── Upload logic ─────────────────────────────────────────────────────────────
@@ -106,28 +114,10 @@ async function clearPendingUpload(chatId) {
 async function uploadFromUrl(sourceUrl, filename) {
   const res = await fetch(sourceUrl);
   if (!res.ok) throw new Error(`Failed to fetch: ${res.status}`);
-
   const contentType = res.headers.get("content-type") || "application/octet-stream";
-  const arrayBuffer = await res.arrayBuffer();
-  const buffer = Buffer.from(arrayBuffer);
-
-  // Vercel Blob free limit: 500MB total, 4.5MB per serverless request body
-  // Files come via Telegram (max 50MB for bots), but serverless has 10s timeout
-  // We stream directly to Blob to avoid memory issues
-  const blob = await put(filename, buffer, {
-    access: "public",
-    contentType,
-    addRandomSuffix: true,
-  });
-
+  const buffer = Buffer.from(await res.arrayBuffer());
+  const blob = await put(filename, buffer, { access: "public", contentType, addRandomSuffix: true });
   return { url: blob.url, size: buffer.length, contentType };
-}
-
-async function storeFileMeta(fileKey, meta) {
-  // Store file metadata with expiry tracking
-  await kv.set(`file:${fileKey}`, JSON.stringify(meta), { ex: meta.ttl + 3600 }); // extra hour buffer
-  // Add to global file index for cleanup
-  await kv.zadd("files_by_expiry", { score: meta.expiresAt, member: fileKey });
 }
 
 // ─── Main handler ─────────────────────────────────────────────────────────────
@@ -138,9 +128,12 @@ export default async function handler(req, res) {
   if (req.method !== "POST") return res.status(405).end("Method Not Allowed");
 
   const update = req.body;
+  let r = null;
 
   try {
-    // ── Callback query (duration selection) ──────────────────────────────────
+    r = await getRedis();
+
+    // ── Callback query (duration button tapped) ───────────────────────────
     if (update.callback_query) {
       const cb = update.callback_query;
       const chatId = cb.message.chat.id;
@@ -150,26 +143,24 @@ export default async function handler(req, res) {
 
       if (cb.data.startsWith("dur_")) {
         const ttl = parseInt(cb.data.replace("dur_", ""), 10);
-        const pending = await getPendingUpload(chatId);
+        const pending = await getPendingUpload(r, chatId);
 
         if (!pending) {
           await editMessage(chatId, msgId, "⚠️ Session expired. Please send your file again.");
           return res.status(200).end();
         }
 
-        await editMessage(chatId, msgId, `⏳ Uploading… please wait.`);
+        await editMessage(chatId, msgId, "⏳ Uploading… please wait.");
 
         try {
           let uploadResult;
           let originalName = pending.filename || "file";
 
           if (pending.type === "link") {
-            // Direct link upload
             const urlObj = new URL(pending.url);
             originalName = urlObj.pathname.split("/").pop() || "download";
             uploadResult = await uploadFromUrl(pending.url, originalName);
           } else {
-            // Telegram file
             const telegramUrl = await getFileUrl(pending.fileId);
             if (!telegramUrl) throw new Error("Could not get file from Telegram");
             uploadResult = await uploadFromUrl(telegramUrl, originalName);
@@ -178,7 +169,7 @@ export default async function handler(req, res) {
           const expiresAt = Date.now() + ttl * 1000;
           const fileKey = uploadResult.url.split("/").pop().split("?")[0];
 
-          await storeFileMeta(fileKey, {
+          await storeFileMeta(r, fileKey, {
             blobUrl: uploadResult.url,
             filename: originalName,
             size: uploadResult.size,
@@ -189,98 +180,83 @@ export default async function handler(req, res) {
             uploadedAt: Date.now(),
           });
 
-          await clearPendingUpload(chatId);
+          await clearPendingUpload(r, chatId);
 
           const sizeStr =
-            uploadResult.size < 1024
-              ? `${uploadResult.size} B`
-              : uploadResult.size < 1048576
-              ? `${(uploadResult.size / 1024).toFixed(1)} KB`
-              : `${(uploadResult.size / 1048576).toFixed(1)} MB`;
-
-          const expiryDate = new Date(expiresAt).toUTCString();
+            uploadResult.size < 1024 ? `${uploadResult.size} B`
+            : uploadResult.size < 1048576 ? `${(uploadResult.size / 1024).toFixed(1)} KB`
+            : `${(uploadResult.size / 1048576).toFixed(1)} MB`;
 
           await editMessage(
-            chatId,
-            msgId,
+            chatId, msgId,
             `✅ <b>File uploaded successfully!</b>\n\n` +
-              `📁 <b>File:</b> ${originalName}\n` +
-              `📦 <b>Size:</b> ${sizeStr}\n` +
-              `🔗 <b>Link:</b> <a href="${uploadResult.url}">${uploadResult.url}</a>\n\n` +
-              `⏳ <b>Expires in:</b> ${formatDuration(ttl)}\n` +
-              `🗓 <b>Expires at:</b> ${expiryDate}\n\n` +
-              `<i>The file will be automatically deleted after this time.</i>`
+            `📁 <b>File:</b> ${originalName}\n` +
+            `📦 <b>Size:</b> ${sizeStr}\n` +
+            `🔗 <b>Link:</b> <a href="${uploadResult.url}">${uploadResult.url}</a>\n\n` +
+            `⏳ <b>Expires in:</b> ${formatDuration(ttl)}\n` +
+            `🗓 <b>Expires at:</b> ${new Date(expiresAt).toUTCString()}\n\n` +
+            `<i>The file will be automatically deleted after this time.</i>`
           );
         } catch (err) {
           console.error("Upload error:", err);
-          await editMessage(
-            chatId,
-            msgId,
-            `❌ <b>Upload failed:</b> ${err.message}\n\nPlease try again.`
-          );
+          await editMessage(chatId, msgId, `❌ <b>Upload failed:</b> ${err.message}\n\nPlease try again.`);
         }
       }
 
       return res.status(200).end();
     }
 
-    // ── Regular message ───────────────────────────────────────────────────────
+    // ── Regular message ───────────────────────────────────────────────────
     if (!update.message) return res.status(200).end();
 
     const msg = update.message;
     const chatId = msg.chat.id;
     const text = msg.text || "";
 
-    // /start command
-    if (text === "/start" || text.startsWith("/start")) {
-      await sendMessage(
-        chatId,
+    if (text === "/start" || text.startsWith("/start ")) {
+      await sendMessage(chatId,
         `👋 <b>Welcome to FileHost Bot!</b>\n\n` +
-          `I can host your files temporarily on a secure server.\n\n` +
-          `<b>How to use:</b>\n` +
-          `• Send me any file (document, photo, video, audio)\n` +
-          `• Or send me a direct link to a file\n` +
-          `• Choose how long to keep it (10 min → 24 hours)\n` +
-          `• Get your shareable link instantly!\n\n` +
-          `<b>Limits:</b>\n` +
-          `• Max file size: 50 MB (Telegram bot limit)\n` +
-          `• Files are auto-deleted after your chosen time\n\n` +
-          `Send me a file or link to get started! 🚀`
+        `I can host your files temporarily on a secure server.\n\n` +
+        `<b>How to use:</b>\n` +
+        `• Send me any file (document, photo, video, audio)\n` +
+        `• Or send me a direct link to a file\n` +
+        `• Choose how long to keep it (10 min → 24 hours)\n` +
+        `• Get your shareable link instantly!\n\n` +
+        `<b>Limits:</b>\n` +
+        `• Max file size: 50 MB (Telegram bot limit)\n` +
+        `• Files are auto-deleted after your chosen time\n\n` +
+        `Send me a file or link to get started! 🚀`
       );
       return res.status(200).end();
     }
 
-    // /help command
     if (text === "/help") {
-      await sendMessage(
-        chatId,
+      await sendMessage(chatId,
         `<b>FileHost Bot Help</b>\n\n` +
-          `<b>Commands:</b>\n` +
-          `/start — Welcome message\n` +
-          `/help — This help message\n` +
-          `/web — Get the web upload link\n\n` +
-          `<b>Usage:</b>\n` +
-          `1. Send a file or a direct URL\n` +
-          `2. Choose expiry duration\n` +
-          `3. Share the link!\n\n` +
-          `<b>Supported:</b> Any file type up to 50MB`
+        `<b>Commands:</b>\n` +
+        `/start — Welcome message\n` +
+        `/help — This help message\n` +
+        `/web — Get the web upload link\n\n` +
+        `<b>Usage:</b>\n` +
+        `1. Send a file or a direct URL\n` +
+        `2. Choose expiry duration\n` +
+        `3. Share the link!\n\n` +
+        `<b>Supported:</b> Any file type up to 50MB`
       );
       return res.status(200).end();
     }
 
-    // /web command
     if (text === "/web") {
-      await sendMessage(
-        chatId,
+      await sendMessage(chatId,
         `🌐 <b>Web Upload Interface</b>\n\n` +
-          `You can also upload files via the web:\n` +
-          `<a href="${BASE_URL}">${BASE_URL}</a>\n\n` +
-          `The web interface supports files up to 4MB via browser upload.`
+        `You can also upload files via the web:\n` +
+        `<a href="${BASE_URL}">${BASE_URL}</a>\n\n` +
+        `The web interface supports files up to 4.5MB via browser upload.`
       );
       return res.status(200).end();
     }
 
-    // Text message — check if it's a URL
+    // Check if text is a URL
     if (text && !text.startsWith("/")) {
       let isUrl = false;
       try {
@@ -289,23 +265,19 @@ export default async function handler(req, res) {
       } catch {}
 
       if (isUrl) {
-        await setPendingUpload(chatId, { type: "link", url: text.trim() });
-        await sendMessageWithKeyboard(
-          chatId,
+        await setPendingUpload(r, chatId, { type: "link", url: text.trim() });
+        await sendMessageWithKeyboard(chatId,
           `🔗 <b>Link detected!</b>\n\n<code>${text.trim()}</code>\n\nHow long should I keep this file?`,
           durationKeyboard()
         );
         return res.status(200).end();
       }
 
-      await sendMessage(
-        chatId,
-        `ℹ️ Please send me a file or a direct download link.\n\nUse /help for more info.`
-      );
+      await sendMessage(chatId, `ℹ️ Please send me a file or a direct download link.\n\nUse /help for more info.`);
       return res.status(200).end();
     }
 
-    // File types
+    // Handle file types
     let fileId = null;
     let filename = "file";
 
@@ -334,19 +306,20 @@ export default async function handler(req, res) {
     }
 
     if (fileId) {
-      await setPendingUpload(chatId, { type: "file", fileId, filename });
-      await sendMessageWithKeyboard(
-        chatId,
+      await setPendingUpload(r, chatId, { type: "file", fileId, filename });
+      await sendMessageWithKeyboard(chatId,
         `📁 <b>File received!</b>\n\n<code>${filename}</code>\n\nHow long should I keep this file?`,
         durationKeyboard()
       );
       return res.status(200).end();
     }
 
-    // Unknown
     await sendMessage(chatId, `ℹ️ Send me a file or a direct URL to upload it. Use /help for info.`);
+
   } catch (err) {
     console.error("Handler error:", err);
+  } finally {
+    if (r) await r.quit().catch(() => {});
   }
 
   return res.status(200).end();

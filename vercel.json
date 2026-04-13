@@ -5,20 +5,10 @@
       "maxDuration": 60
     }
   },
-  "routes": [
-    {
-      "src": "/api/(.*)",
-      "dest": "/api/$1"
-    },
-    {
-      "src": "/(.*)",
-      "dest": "/public/$1"
-    }
-  ],
   "crons": [
     {
       "path": "/api/cleanup",
-      "schedule": "0 0 * * *"
+      "schedule": "0 * * * *"
     }
   ]
 }

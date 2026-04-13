@@ -2,6 +2,7 @@
   "name": "vercel-filehost",
   "version": "1.0.0",
   "description": "Telegram bot + web UI for temporary file hosting on Vercel",
+  "type": "module",
   "scripts": {
     "dev": "vercel dev",
     "deploy": "vercel --prod"
@@ -12,6 +13,6 @@
     "redis": "^4.7.0"
   },
   "engines": {
-    "node": ">=18"
+    "node": "18.x"
   }
 }
