@@ -1,31 +1,86 @@
 // api/_redis.js
-// Shared Redis connection helper — handles both redis:// and rediss:// URLs
-// correctly on Node 24 where the redis npm package requires explicit TLS opts.
+// Redis helper using @upstash/redis (HTTP/REST based — no TCP sockets,
+// works perfectly on Vercel serverless without connection issues).
+// Exposes the same interface the rest of the code expects.
 
-import { createClient } from "redis";
+import { Redis } from "@upstash/redis";
 
+// @upstash/redis reads UPSTASH_REDIS_REST_URL and UPSTASH_REDIS_REST_TOKEN
+// automatically — but our env var is called REDIS_URL (a full redis:// URI).
+// We parse it here so the user only needs one env var.
+function buildClient() {
+  const raw = process.env.REDIS_URL || "";
+
+  // If the user has set UPSTASH_REDIS_REST_URL directly, use that.
+  if (process.env.UPSTASH_REDIS_REST_URL && process.env.UPSTASH_REDIS_REST_TOKEN) {
+    return new Redis({
+      url: process.env.UPSTASH_REDIS_REST_URL,
+      token: process.env.UPSTASH_REDIS_REST_TOKEN,
+    });
+  }
+
+  // Parse redis[s]://default:PASSWORD@HOST:PORT into REST URL + token.
+  // Upstash REST URL is always https://HOST (same host, different port/protocol).
+  try {
+    const u = new URL(raw);
+    const password = u.password;          // this is the Upstash token
+    const host = u.hostname;              // e.g. gentle-goldfish-98196.upstash.io
+    const restUrl = `https://${host}`;
+    return new Redis({ url: restUrl, token: password });
+  } catch {
+    throw new Error("REDIS_URL is missing or malformed. Set it to your Upstash redis[s]:// URL.");
+  }
+}
+
+// Wrap @upstash/redis to match the subset of redis-npm API we use:
+//   r.set(key, val, { EX })
+//   r.get(key)
+//   r.del(key)
+//   r.zAdd(key, { score, value })
+//   r.zRange(key, min, max, { BY: "SCORE", LIMIT })
+//   r.zRem(key, member)
+//   r.quit()  ← no-op for HTTP client
 export async function getRedis() {
-  const rawUrl = process.env.REDIS_URL || "";
+  const client = buildClient();
 
-  // Upstash gives a rediss:// URL (TLS). The redis npm package on Node 24
-  // needs socket.tls:true set explicitly — it no longer infers it from the
-  // protocol. We rewrite rediss:// → redis:// and set tls manually.
-  const isTls = rawUrl.startsWith("rediss://");
-  const url = isTls ? rawUrl.replace(/^rediss:\/\//, "redis://") : rawUrl;
-
-  const client = createClient({
-    url,
-    socket: {
-      tls: isTls,
-      // Upstash uses a self-signed cert chain on some plans; rejectUnauthorized
-      // false prevents CERT_HAS_EXPIRED / self-signed errors without compromising
-      // security meaningfully (Upstash traffic is still TLS-encrypted).
-      rejectUnauthorized: false,
-      reconnectStrategy: false, // don't retry on serverless — fail fast
+  return {
+    async set(key, value, opts) {
+      if (opts?.EX) return client.set(key, value, { ex: opts.EX });
+      return client.set(key, value);
     },
-  });
-
-  client.on("error", (err) => console.error("Redis client error:", err));
-  await client.connect();
-  return client;
+    async get(key) {
+      const val = await client.get(key);
+      // @upstash/redis auto-parses JSON — re-stringify objects so callers
+      // can always JSON.parse() the result themselves consistently.
+      if (val !== null && typeof val === "object") return JSON.stringify(val);
+      return val;
+    },
+    async del(key) {
+      return client.del(key);
+    },
+    async zAdd(key, member) {
+      // @upstash/redis: zadd(key, { score, member })
+      return client.zadd(key, { score: member.score, member: member.value });
+    },
+    async zRange(key, min, max, opts) {
+      if (opts?.BY === "SCORE") {
+        const limit = opts?.LIMIT;
+        if (limit) {
+          return client.zrange(key, min, max, {
+            byScore: true,
+            offset: limit.offset,
+            count: limit.count,
+          });
+        }
+        return client.zrange(key, min, max, { byScore: true });
+      }
+      return client.zrange(key, min, max);
+    },
+    async zRem(key, member) {
+      return client.zrem(key, member);
+    },
+    async quit() {
+      // HTTP client — nothing to close
+    },
+  };
 }
