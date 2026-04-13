@@ -1,22 +1,12 @@
 // api/telegram.js
-// Telegram webhook handler — receives updates and processes file/link uploads
-
 import { put } from "@vercel/blob";
-import { createClient } from "redis";
+import { getRedis } from "./_redis.js";
 
 const BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
 const TELEGRAM_API = `https://api.telegram.org/bot${BOT_TOKEN}`;
 const BASE_URL = process.env.VERCEL_URL
   ? `https://${process.env.VERCEL_URL}`
   : process.env.BASE_URL;
-
-// Fresh Redis connection per invocation — singleton breaks on Vercel serverless
-async function getRedis() {
-  const client = createClient({ url: process.env.REDIS_URL });
-  client.on("error", (err) => console.error("Redis error:", err));
-  await client.connect();
-  return client;
-}
 
 // ─── Telegram helpers ────────────────────────────────────────────────────────
 
@@ -174,9 +164,7 @@ export default async function handler(req, res) {
             filename: originalName,
             size: uploadResult.size,
             contentType: uploadResult.contentType,
-            chatId,
-            ttl,
-            expiresAt,
+            chatId, ttl, expiresAt,
             uploadedAt: Date.now(),
           });
 
@@ -256,7 +244,6 @@ export default async function handler(req, res) {
       return res.status(200).end();
     }
 
-    // Check if text is a URL
     if (text && !text.startsWith("/")) {
       let isUrl = false;
       try {
@@ -277,7 +264,6 @@ export default async function handler(req, res) {
       return res.status(200).end();
     }
 
-    // Handle file types
     let fileId = null;
     let filename = "file";
 

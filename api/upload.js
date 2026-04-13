@@ -1,8 +1,6 @@
 // api/upload.js
-// Web UI upload endpoint — handles multipart file uploads and URL uploads
-
 import { put } from "@vercel/blob";
-import { createClient } from "redis";
+import { getRedis } from "./_redis.js";
 import busboy from "busboy";
 
 export const config = {
@@ -12,15 +10,6 @@ export const config = {
   },
 };
 
-// Fresh Redis connection per invocation — singleton breaks on Vercel serverless
-async function getRedis() {
-  const client = createClient({ url: process.env.REDIS_URL });
-  client.on("error", (err) => console.error("Redis error:", err));
-  await client.connect();
-  return client;
-}
-
-// Parse multipart/form-data into memory (no temp files) using busboy
 function parseMultipart(req) {
   return new Promise((resolve, reject) => {
     const MAX = 4.5 * 1024 * 1024;
@@ -91,8 +80,7 @@ export default async function handler(req, res) {
       if (!fileRes.ok) return res.status(400).json({ error: `Cannot fetch URL: ${fileRes.status}` });
 
       const contentTypeHeader = fileRes.headers.get("content-type") || "application/octet-stream";
-      const arrayBuffer = await fileRes.arrayBuffer();
-      const buffer = Buffer.from(arrayBuffer);
+      const buffer = Buffer.from(await fileRes.arrayBuffer());
 
       if (buffer.length > 4.5 * 1024 * 1024)
         return res.status(413).json({ error: "File too large. Web upload limit is 4.5MB." });
@@ -105,7 +93,6 @@ export default async function handler(req, res) {
 
       const expiresAt = Date.now() + ttl * 1000;
       const fileKey = blob.url.split("/").pop().split("?")[0];
-
       await storeFileMeta(r, fileKey, {
         blobUrl: blob.url, filename, size: buffer.length,
         contentType: contentTypeHeader, ttl, expiresAt,
@@ -140,7 +127,6 @@ export default async function handler(req, res) {
 
       const expiresAt = Date.now() + ttl * 1000;
       const fileKey = blob.url.split("/").pop().split("?")[0];
-
       await storeFileMeta(r, fileKey, {
         blobUrl: blob.url, filename, size: fileBuffer.length,
         contentType: mimeType, ttl, expiresAt,
